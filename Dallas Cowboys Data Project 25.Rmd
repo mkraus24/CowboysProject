@@ -1,0 +1,340 @@
+---
+title: "Cowboys Data Project"
+author: "Applicant #25"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r Libraries}
+library(tidyverse)
+library(tidymodels)
+library(vip)
+library(jsonlite)
+library(readxl)
+library(data.table)
+library(gt)
+library(gtExtras)
+
+Sys.setenv(CHROMOTE_CHROME = "C:/Users/15622/AppData/Local/Google/Chrome/Application/chrome.exe")
+```
+
+```{r Import Games}
+json <- as.list(fromJSON("Cowboys Data Project/games.json"))
+
+games_json <- data.table()
+weeks <- data.table()
+for (i in 1:length(json$data)){
+  weeks <- rbind(weeks, rep(json$week[i], nrow(json$data[[i]])))
+  games_json <- rbind(games_json, json$data[[i]])
+}
+
+games <- cbind(weeks, games_json) %>% rename(week = x)
+```
+
+```{r Import Offense}
+offense_file <- "Cowboys Data Project/offense.xlsx"
+sheet_names <- excel_sheets(offense_file)
+
+offense <- data.table()
+for (i in sheet_names) {
+  offense <- rbind(offense, read_excel(offense_file, sheet = i))
+}
+```
+
+```{r Import Plays}
+plays <- data.table(read_csv("Cowboys Data Project/plays.csv", show_col_types = F))
+```
+
+```{r Add New Columns}
+offense1 <- unique(offense)
+
+offense1 <- offense1 %>% mutate(ball_carrier = factor(ifelse(is.na(ball_carrier), 0, 1)),
+                               passer = factor(ifelse(is.na(passer), 0, 1)),
+                               targeted_receiver = factor(ifelse(is.na(targeted_receiver), 0, 1)),
+                               touchdown = factor(ifelse(is.na(touchdown), 0, 1)),
+                               interception = factor(ifelse(is.na(interception), 0, 1)),
+                               dropped_pass = factor(ifelse(is.na(dropped_pass), 0, 1)),
+                               pressure_allowed = factor(ifelse(is.na(pressure_allowed), 0, 1)),
+                               sack_allowed = factor(ifelse(is.na(sack_allowed), 0, 1)))
+
+offense1 <- offense1[!(assignment %in% c("Run Block", "Rush"))]
+
+plays1 <- plays %>% mutate(off_personnel = paste0(off_rb_count, off_te_count)) %>% relocate(off_personnel, .after = off_ol_count)
+
+plays1[, pass_rush_result := ifelse(is.na(pass_rush_result), "NONE", pass_rush_result)]
+
+plays1[, blitz := ifelse(def_pass_rusher_count > 4, 1, 0)]
+
+plays1 <- plays1[!(is.na(def_dl_count) | is.na(def_lb_count) | is.na(def_db_count))]
+
+plays1[, def_onfield_count := def_dl_count + def_lb_count + def_db_count]
+
+plays1 <- plays1[def_onfield_count == 11]
+
+plays1[, def_personnel := paste0(def_dl_count, "-", def_lb_count, "-", def_db_count, " ")]
+
+plays1[, def_package := ifelse(str_detect(def_personnel, "-1 ") | str_detect(def_personnel, "-2 "), "GOAL LINE",
+                               ifelse(str_detect(def_personnel, "-3 "), "3 DB",
+                                      ifelse(str_detect(def_personnel, "5-2-4 "), "5-2",
+                                             ifelse(def_personnel %in% c("2-5-4 ", "3-4-4 "), "BASE 3-4",
+                                                    ifelse(def_personnel == "4-3-4 ", "BASE 4-3",
+                                                           ifelse(str_detect(def_personnel, "-5 "), "NICKEL",
+                                                                  ifelse(str_detect(def_personnel, "-6 "), "DIME",
+                                                                         ifelse(str_detect(def_personnel, "-7 "), "QUARTERS", "PREVENT"))))))))]
+
+plays1[, score_diff := off_score - def_score]
+
+plays1[, gain_loss := ifelse(play_result == "NO PLAY", penalty_yards, gain_loss)]
+
+plays1[, gain_loss := ifelse(play_result %in% c("BATTED PASS", "HIT AS THREW", "INCOMPLETE", "THROWN AWAY"), 0, gain_loss)]
+
+plays1[, efficient_play := ifelse(down == 1 & distance <= 5 & gain_loss >= 5, 1,
+                                  ifelse(down == 1 & distance >= 6 & gain_loss >= 0.7*distance, 1,
+                                         ifelse(down == 2 & distance <= 8 & gain_loss >= 8, 1,
+                                                ifelse(down == 2 & distance >= 9 & gain_loss >= 0.8*distance, 1,
+                                                       ifelse(down == 3 & gain_loss >= distance, 1,
+                                                              ifelse(down == 4 & gain_loss >= distance, 1, 0))))))]
+ 
+plays1[is.na(gain_loss)]$efficient_play <- 0
+```
+
+```{r Team Efficiency}
+team_efficiency <- data.table(plays1 %>% group_by(offense, down) %>% summarise(PctEfficient = sum(efficient_play == 1) / n()) %>% filter(down != 0))
+```
+
+```{r Targeted Reciever Only / Fix Routes}
+targeted_wr <- offense1[targeted_receiver == 1 & !(assignment %in% c("Pass", "Pass Block")) & !(is.na(pass_route_name) & is.na(pass_route_group)) & !(pass_route_name %in% c("Run Play", "Pass Block Left", "Pass Block", "Pass Block Right"))]
+
+route_group_nas <- targeted_wr[is.na(pass_route_group)]$pass_route_name %>% unique()
+route_group <- c()
+for (i in 1:length(route_group_nas)){
+  table <- sort(table(targeted_wr[pass_route_name == route_group_nas[i]]$pass_route_group), decreasing = T)
+  route_group <- append(route_group, names(table[1]))
+}
+
+targeted_wr[, pass_route_group := ifelse(is.na(pass_route_group) & pass_route_name == "Slant", "Slants",
+                                         ifelse(is.na(pass_route_group) & pass_route_name %in% c("Screen", "Shovel"), "HB Screens",
+                                                ifelse(is.na(pass_route_group) & pass_route_name %in% c("Flat", "Out", "Out-Sit", "Flat-Hitch", "Whip-Out", "Hitch-Out", "Out Inside Release", "Out Outside Release"), "Out Routes",
+                                                       ifelse(is.na(pass_route_group) & pass_route_name %in% c("Wide Hitch", "Flare"), "Flares",
+                                                              ifelse(is.na(pass_route_group) & pass_route_name %in% c("Jet", "Drag", "Under", "Drag-Wheel", "Behind LB", "Over", "Ghost"), "Crossing Routes",
+                                                                     ifelse(is.na(pass_route_group) & pass_route_name %in% c("Pivot", "HB angle right", "HB angle left", "Circle"), "Pivots",
+                                                                            ifelse(is.na(pass_route_group) & pass_route_name %in% c("Sit", "Hitch", "Hitch Outside Release", "Hitch Inside Release", "Hot", "Slant-Hitch", "Out-Hitch", "Post-Sit", "In-Hitch"), "Hitches",
+                                                                                   ifelse(is.na(pass_route_group) & pass_route_name %in% c("Corner", "Corner Outside Release", "Corner Inside Release"), "Corner Routes",
+                                                                                          ifelse(is.na(pass_route_group) & pass_route_name %in% c("Back Shoulder Go", "Seam", "Out & Up", "Flat & Up", "Go Outside Release", "Numbers go", "Stutter go", "Back Shoulder Go Outside Release", "Fade", "Cross-Seam", "Go", "Corner-Go", "Seam Outside Release"), "Go Routes",
+                                                                                                 ifelse(is.na(pass_route_group) & pass_route_name %in% c("WR Screen", "Bubble"), "WR/TE Screens",
+                                                                                                        ifelse(is.na(pass_route_group) & pass_route_name == "Post", "Post Routes",
+                                                                                                               ifelse(is.na(pass_route_group) & pass_route_name %in% c("Wheel", "Flat-up"), "Wheels",
+                                                                                                               ifelse(is.na(pass_route_group) & pass_route_name %in% c("In Inside Release", "In"), "In Routes",
+                                                                                                                      ifelse(is.na(pass_route_group) & pass_route_name == "Comeback", "Comebacks", pass_route_group))))))))))))))]
+```
+
+```{r Join Targeted Route to Plays / Efficiency by Targeted Route Group}
+targeted_route <- data.table(inner_join(plays1, targeted_wr %>% select(game_id, play_id, pass_route_group)))
+
+targeted_route <- targeted_route[play_result != "NO PLAY"]
+
+targeted_route[, pass_depth_beyond_1stdown := pass_depth - distance]
+
+targeted_route[, route_group_depth := factor(ifelse(pass_route_group %in% c("Flares", "HB Screens", "Hitches", "Pivots", "Slants", "WR/TE Screens", "Crossing Routes"), "Short Passing Concepts",
+                                             ifelse(pass_route_group %in% c("Comebacks", "In Routes", "Out Routes", "Wheels"), "Medium Passing Concepts", "Deep Passing Concepts")), levels = c("Short Passing Concepts", "Medium Passing Concepts", "Deep Passing Concepts"))]
+
+efficiency_byroute <- data.table(targeted_route %>% group_by(pass_route_group, route_group_depth) %>% summarise(PctEfficient = sum(efficient_play == 1) / n(), AvgDepth = mean(pass_depth)) %>% filter(pass_route_group != "Modifiers") %>% arrange(pass_route_group)) %>% rename(RouteGroup = pass_route_group)
+```
+
+```{r Efficiency by Route Visualization}
+routeefficiency_table <- 
+efficiency_byroute %>% 
+  arrange(route_group_depth, desc(PctEfficient)) %>%
+  mutate(PctEfficient = round(PctEfficient, 3) * 100) %>%
+  mutate(AvgDepth = round(AvgDepth, 1)) %>% 
+  gt(groupname_col = "route_group_depth") %>% 
+  gt_theme_538() %>% 
+  tab_header(title = "Efficiency % By Route") %>% 
+  cols_label(RouteGroup = "Route",
+             PctEfficient = "Efficiency (%)",
+             AvgDepth = "Avg Catch Depth") %>% 
+  cols_align(columns = everything(), align = "right") %>%
+  cols_width(RouteGroup ~ px(165)) %>%
+  cols_width(AvgDepth ~ px(85)) %>%
+  tab_style(
+    style = cell_text(align = "center"),
+    locations = cells_column_labels(columns = AvgDepth)) %>% 
+  tab_style(locations = cells_body(columns = PctEfficient),
+            style = cell_text(color = "white")
+            ) %>% 
+  data_color(columns = PctEfficient,
+             autocolor_text = F,
+             fn = scales::col_numeric(
+               palette = "Blues",
+               domain = c(0, 55)
+               )
+             ) %>%
+  opt_align_table_header(align = "center")
+
+# gtsave(routeefficiency_table,
+#        filename = "gt_routeefficiency.html",
+#        path = "C:/Users/15622/Dropbox/PC/Desktop/PROJECTS/Cowboys Data Project")
+```
+
+```{r Efficiency / Points Data}
+homepoints <- games %>% group_by(home_franchise) %>% summarise(HomePoints = sum(home_score_point_total))
+awaypoints <- games %>% group_by(away_franchise) %>% summarise(AwayPoints = sum(vis_score_point_total))
+points <- data.table(left_join(homepoints, awaypoints, by = c("home_franchise" = "away_franchise"))) %>% rename(offense = home_franchise)
+points[, TotalPoints := HomePoints + AwayPoints]
+points[, AvgPoints := TotalPoints / 16]
+
+efficiency_points <- left_join(team_efficiency, points %>% select(offense, AvgPoints), by = "offense")
+```
+
+```{r Efficiency vs. Points Visualizations}
+efficiency_points_1st <- 
+efficiency_points %>% 
+  filter(down == 1) %>% 
+  ggplot(aes(x = PctEfficient, y = AvgPoints)) +
+  geom_text(aes(label = offense), alpha = 0.6) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(title = "PPG Based on 1st Down Efficiency",
+       x = "% of Plays that Met Success Factor",
+       y = "Points Scored Per Game",
+       caption = "Correlation = 57.4%") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid = element_line(color = "#E5E5E5"))
+
+efficiency_points_2nd <- 
+efficiency_points %>% 
+  filter(down == 2) %>% 
+  ggplot(aes(x = PctEfficient, y = AvgPoints)) +
+  geom_text(aes(label = offense), alpha = 0.6) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(title = "PPG Based on 2nd Down Efficiency",
+       x = "% of Plays that Met Success Factor",
+       y = "Points Scored Per Game",
+       caption = "Correlation = 48.2%") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid = element_line(color = "#E5E5E5"))
+
+efficiency_points_3rd <- 
+efficiency_points %>% 
+  filter(down == 3) %>% 
+  ggplot(aes(x = PctEfficient, y = AvgPoints)) +
+  geom_text(aes(label = offense), alpha = 0.6) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(title = "PPG Based on 3rd Down Efficiency",
+       x = "% of Plays that Met Success Factor",
+       y = "Points Scored Per Game",
+       caption = "Correlation = 70.2%") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid = element_line(color = "#E5E5E5"))
+
+# ggsave(filename = "efficiencypoints1st.png", plot = efficiency_points_1st)
+# ggsave(filename = "efficiencypoints2nd.png", plot = efficiency_points_2nd)
+# ggsave(filename = "efficiencypoints3rd.png", plot = efficiency_points_3rd)
+```
+
+```{r Model Data / Split / KFold}
+modeldata <- targeted_route %>% select(offense,
+                                       down,
+                                       field_position,
+                                       off_personnel,
+                                       pass_route_group,
+                                       pass_depth_beyond_1stdown,
+                                       def_package,
+                                       efficient_play) %>% 
+                                mutate(efficient_play = factor(efficient_play))
+
+set.seed(123)
+split <- initial_split(modeldata, prop = 0.7, strata = efficient_play)
+train <- training(split)
+test <- testing(split)
+
+recipe <- recipe(efficient_play ~ down + field_position + off_personnel + pass_route_group + pass_depth_beyond_1stdown + def_package, data = train) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_dummy(all_nominal_predictors())
+
+kfold <- vfold_cv(train, v = 5, strata = efficient_play)
+```
+
+```{r Model 1}
+set.seed(123)
+xgb_model <- boost_tree(trees = 1000,
+                        tree_depth = 9,
+                        min_n = 19,
+                        loss_reduction = 0.0000000257,
+                        sample_size = 0.811,
+                        mtry = 5,
+                        learn_rate = 0.00792) %>% 
+                        set_engine("xgboost") %>% 
+                        set_mode("classification")
+
+# set.seed(123)
+# xgb_grid <- grid_latin_hypercube(
+#   tree_depth(),
+#   min_n(),
+#   loss_reduction(),
+#   sample_size = sample_prop(),
+#   finalize(mtry(), train %>% select(-efficient_play, -offense)),
+#   learn_rate(),
+#   size = 100)
+
+xgb_wf <- workflow() %>%
+   add_model(xgb_model) %>%
+   add_recipe(recipe)
+
+# set.seed(123)
+# xgb_tune <- tune_grid(
+#   xgb_wf,
+#   resamples = kfold,
+#   grid = xgb_grid,
+#   control = control_grid(save_pred = TRUE)
+# )
+# 
+# collect_metrics(xgb_tune)
+# 
+# xgb_best <- select_best(xgb_tune, "roc_auc")
+# 
+# xgb_final <- finalize_workflow(xgb_wf,
+#                                 xgb_best)
+
+set.seed(123)
+xgb_final_fit <- xgb_wf %>%
+   fit(data = train)
+
+xgb_pred <- data.table(xgb_final_fit %>% predict(train, type = "prob") %>% bind_cols(train))
+
+xgb_predtest <- data.table(xgb_final_fit %>% predict(test, type = "prob") %>% bind_cols(test))
+
+xgb_fullpreds <- rbind(xgb_pred, xgb_predtest)
+
+vipplot <- xgb_final_fit %>% extract_fit_parsnip() %>% vip(25)
+
+# ggsave(filename = "vipplot.png", plot = vipplot)
+```
+
+```{r Predicted vs. Actual Data}
+efficiency_byteam <- data.table(targeted_route %>% group_by(offense) %>% summarise(PctEfficient = sum(efficient_play == 1) / n()) %>% print(n = 32))
+pred_efficiency_byteam <- data.table(xgb_fullpreds %>% group_by(offense) %>% summarise(EfficiencyPred = mean(.pred_1), Plays = n()))
+actualvspred <- left_join(efficiency_byteam, pred_efficiency_byteam %>% select(-Plays))
+
+actualvspred_plot <- 
+actualvspred %>% 
+  ggplot(aes(x = PctEfficient, y = EfficiencyPred)) +
+  geom_text(aes(label = offense), alpha = 0.7) +
+  geom_smooth(method = "lm", alpha = 0.1) +
+  labs(title = "Actual vs. Expected Efficiency by Team",
+       x = "Actual % of Plays That Met Success Factor",
+       y = "Expected % of Plays That Met Success Factor",
+       caption = "Correlation = 58.6%") +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# ggsave(filename = "actual_vs_pred.png", plot = actualvspred_plot)
+```
